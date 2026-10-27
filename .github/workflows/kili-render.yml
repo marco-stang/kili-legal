@@ -1,0 +1,86 @@
+# Kili Render: setzt Frage (oben) und "Free on Google Play" (unten) auf einen
+# automatisch erzeugten Kili-Clip und legt ihn auf GitHub Pages ab.
+# Ausgelöst vom n8n-Workflow "Kili: Instagram + YouTube" (repository_dispatch)
+# oder von Hand (workflow_dispatch). Meldet das Ergebnis an die Warte-URL von n8n.
+# Alle Eingaben laufen über Umgebungsvariablen und werden geprüft.
+name: Kili Render
+
+on:
+  repository_dispatch:
+    types: [kili-render]
+  workflow_dispatch:
+    inputs:
+      video_url: { description: "Quellvideo (kie.ai)", required: true }
+      job_id: { description: "Kennung, nur A-Z a-z 0-9 _ -", required: true }
+      overlay: { description: "karte | nicht-heute | links-rechts", required: false, default: "karte" }
+      resume_url: { description: "n8n-Warte-URL (optional)", required: false, default: "" }
+
+permissions:
+  contents: write
+  pages: write
+
+concurrency:
+  group: kili-render
+  cancel-in-progress: false
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      VIDEO_URL: ${{ github.event.client_payload.video_url || inputs.video_url }}
+      JOB: ${{ github.event.client_payload.job_id || inputs.job_id }}
+      OVERLAY: ${{ github.event.client_payload.overlay || inputs.overlay }}
+      RESUME_URL: ${{ github.event.client_payload.resume_url || inputs.resume_url }}
+      PAGES: https://marco-stang.github.io/kili-legal
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Eingaben prüfen
+        run: |
+          set -euo pipefail
+          [[ "$JOB" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || { echo "ungültige job_id"; exit 1; }
+          [[ "$OVERLAY" =~ ^(karte|nicht-heute|links-rechts)$ ]] || echo "OVERLAY=karte" >> "$GITHUB_ENV"
+          [[ "$VIDEO_URL" =~ ^https://[a-z0-9.-]*aiquickdraw\.com/ ]] || { echo "Quelle nicht erlaubt"; exit 1; }
+          if [ -n "$RESUME_URL" ] && ! [[ "$RESUME_URL" =~ ^https://n8n\.stangai\.cloud/ ]]; then echo "Warte-URL nicht erlaubt"; exit 1; fi
+
+      - name: ffmpeg installieren
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg >/dev/null
+
+      - name: Rendern
+        run: |
+          set -euo pipefail
+          curl -fsSL --max-time 120 "$VIDEO_URL" -o in.mp4
+          mkdir -p kampagne/auto
+          # Frage 0–3,5 s, Hinweis ab 4 s bis zum Ende; Video auf 720x1280
+          ffmpeg -v error -y -i in.mp4 -loop 1 -t 8 -i "render/hook-$OVERLAY.png" -loop 1 -t 8 -i render/end.png \
+            -filter_complex "[0:v]scale=720:1280,setsar=1[b];[b][1:v]overlay=0:0:shortest=1:enable='lt(t,3.5)'[a];[2:v]format=rgba,fade=t=in:st=4:d=0.3:alpha=1[e];[a][e]overlay=0:0:shortest=1:enable='gte(t,4)',format=yuv420p[v]" \
+            -map "[v]" -map 0:a? -c:v libx264 -preset medium -crf 20 -c:a aac -b:a 160k -movflags +faststart "kampagne/auto/$JOB.mp4"
+          ls -la "kampagne/auto/$JOB.mp4"
+
+      - name: Veröffentlichen (alte Clips > 21 Tage entfernen)
+        run: |
+          set -euo pipefail
+          git config user.name "kili-render"
+          git config user.email "kili-render@users.noreply.github.com"
+          find kampagne/auto -name '*.mp4' -mtime +21 -print -delete || true
+          git add -A kampagne/auto
+          git commit -m "Kili Render: $JOB"
+          for i in 1 2 3; do git pull --rebase -q && git push -q && break; sleep 5; done
+          curl -fsS -X POST -H "Authorization: Bearer ${{ github.token }}" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/pages/builds" >/dev/null || true
+
+      - name: Auf GitHub Pages warten
+        run: |
+          for i in $(seq 1 36); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "$PAGES/kampagne/auto/$JOB.mp4")
+            [ "$code" = 200 ] && echo "online" && exit 0
+            sleep 10
+          done
+          echo "Pages nach 6 min nicht erreichbar"; exit 1
+
+      - name: n8n Bescheid geben
+        if: env.RESUME_URL != ''
+        run: |
+          curl -fsS --max-time 30 -X POST -H "Content-Type: application/json" \
+            -d "{\"video_url\":\"$PAGES/kampagne/auto/$JOB.mp4\",\"job_id\":\"$JOB\"}" "$RESUME_URL"
