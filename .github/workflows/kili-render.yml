@@ -52,10 +52,22 @@ jobs:
           set -euo pipefail
           curl -fsSL --max-time 120 "$VIDEO_URL" -o in.mp4
           mkdir -p kampagne/auto
-          # Frage 0–3,5 s, Hinweis ab 4 s bis zum Ende; Video auf 720x1280
-          ffmpeg -v error -y -i in.mp4 -loop 1 -t 8 -i "render/hook-$OVERLAY.png" -loop 1 -t 8 -i render/end.png \
-            -filter_complex "[0:v]scale=720:1280,setsar=1[b];[b][1:v]overlay=0:0:shortest=1:enable='lt(t,3.5)'[a];[2:v]format=rgba,fade=t=in:st=4:d=0.3:alpha=1[e];[a][e]overlay=0:0:shortest=1:enable='gte(t,4)',format=yuv420p[v]" \
-            -map "[v]" -map 0:a? -c:v libx264 -preset medium -crf 20 -c:a aac -b:a 160k -movflags +faststart "kampagne/auto/$JOB.mp4"
+          D=$(ffprobe -v error -show_entries format=duration -of csv=p=0 in.mp4)
+          # Auflösung: Standbild + Karte mit echtem App-Text (2,4 s); bei "nicht-heute" zieht Kili keine Karte
+          if [ "$OVERLAY" = "nicht-heute" ]; then H=0; KARTE=render/end.png; else
+            H=2.4; N=$(wc -l < render/karten.txt)
+            NR=$(sed -n "$(( $(printf '%s' "$JOB" | cksum | cut -d' ' -f1) % N + 1 ))p" render/karten.txt)
+            KARTE="render/karte-$NR.png"; echo "Karte $NR"
+          fi
+          P=$(awk "BEGIN{print $D + $H}")
+          T=$(awk "BEGIN{print $P + 3.6}")
+          # Tonspur des Clips, sonst Stille
+          if ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 in.mp4 | grep -q .; then A="[0:a]"; ANULL=(); else A="[5:a]"; ANULL=(-f lavfi -t "$T" -i anullsrc=r=44100:cl=stereo); fi
+          # Frage 0–3,5 s, Hinweis ab 4 s, Karte nach Clipende, danach 3,6 s App-Aufnahme
+          ffmpeg -v error -y -i in.mp4 -loop 1 -t "$P" -i "render/hook-$OVERLAY.png" -loop 1 -t "$P" -i render/end.png \
+            -loop 1 -t "$P" -i "$KARTE" -i render/app-ende.mp4 "${ANULL[@]}" \
+            -filter_complex "[0:v]scale=720:1280,setsar=1,fps=24,tpad=stop_mode=clone:stop_duration=$H[b];[b][1:v]overlay=0:0:enable='lt(t,3.5)'[a];[2:v]format=rgba,fade=t=in:st=4:d=0.3:alpha=1[e];[a][e]overlay=0:0:enable='gte(t,4)'[c];[3:v]format=rgba,fade=t=in:st=$D:d=0.2:alpha=1[k];[c][k]overlay=0:0:enable='gte(t,$D)',trim=duration=$P,format=yuv420p,setsar=1[p1];[4:v]fps=24,format=yuv420p,setsar=1[p2];[p1][p2]concat=n=2:v=1:a=0[v];${A}aresample=44100,asetpts=PTS-STARTPTS,apad=whole_dur=$T,afade=t=out:st=$D:d=1.2[au]" \
+            -map "[v]" -map "[au]" -t "$T" -c:v libx264 -preset medium -crf 20 -c:a aac -b:a 160k -movflags +faststart "kampagne/auto/$JOB.mp4"
           ls -la "kampagne/auto/$JOB.mp4"
 
       - name: Veröffentlichen (alte Clips > 21 Tage entfernen)
